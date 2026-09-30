@@ -79,35 +79,54 @@ func (c *Coordinator) Cancel(ctx context.Context, chamberID, reason string) (mod
 	return cycleValue, err
 }
 
+// ApplyGateAck validates a field acknowledgement against the current transit
+// generation before touching command state, gate positions or events. Acks
+// for superseded generations, terminal transits, incompatible stages or
+// already settled commands are rejected with no side effects.
 func (c *Coordinator) ApplyGateAck(ctx context.Context, ack model.DeviceAck) error {
-	command, err := c.gates.Confirm(ctx, ack)
+	// Phase 1: pure validation of the command identity and lifecycle.
+	command, err := c.gates.ValidateAck(ack)
 	if err != nil {
 		return err
 	}
+
+	// Phase 2: validate against the authoritative current generation and
+	// commit every effect while holding the cycle lock, so a cancellation or
+	// replacement generation cannot land between validation and commit.
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	cycleValue, ok := c.current[ack.ChamberID]
 	if !ok || cycleValue.Stage.Terminal() || !cycleValue.IdentityMatches(command.CycleID, command.Generation) {
-		c.mu.Unlock()
 		return errors.New("device acknowledgement belongs to an inactive transit generation")
 	}
 	next, err := nextAfterGate(cycleValue.Stage)
-	if err == nil {
-		err = cycleValue.Advance(next, "matching gate command settled", c.now())
+	if err != nil {
+		return err
 	}
-	if err == nil {
-		c.current[ack.ChamberID] = cycleValue
+	if err := cycleValue.Advance(next, "matching gate command settled", c.now()); err != nil {
+		return err
 	}
-	c.mu.Unlock()
+
+	// Phase 3: commit command + gate observation + command event. The gate
+	// controller repeats command validation atomically, so a command
+	// cancellation racing phase 1 still rejects the ack with nothing changed.
+	commit, err := c.gates.CommitAck(ctx, ack)
 	if err != nil {
 		return err
 	}
 	if next == model.StageLeveling {
 		if err := c.hydraulics.BeginLeveling(cycleValue); err != nil {
+			_ = c.gates.RollbackAck(commit)
 			return err
 		}
 	}
-	_, err = c.recorder.Record(ctx, ack.ChamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue)
-	return err
+	if _, err := c.recorder.Record(ctx, ack.ChamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
+		_ = c.gates.RollbackAck(commit)
+		return err
+	}
+	// Only expose the advanced cycle once every commit above succeeded.
+	c.current[ack.ChamberID] = cycleValue
+	return nil
 }
 
 func (c *Coordinator) ApplySignalHandoff(ctx context.Context, cycleID uuid.UUID, generation uint64) error {

@@ -10,6 +10,13 @@ import (
 	"github.com/wyw14/cry-96/internal/model"
 )
 
+// ErrStaleAck rejects acknowledgements whose command belongs to a cancelled or
+// superseded transit generation.
+var ErrStaleAck = errors.New("device acknowledgement belongs to an inactive transit generation")
+
+// ErrDuplicateAck rejects repeated acknowledgements of an already settled command.
+var ErrDuplicateAck = errors.New("duplicate device acknowledgement for settled command")
+
 // Commands owns command identity, lifecycle and late-ack classification.
 type Commands struct {
 	mu        sync.RWMutex
@@ -66,24 +73,70 @@ func (c *Commands) transition(commandID uuid.UUID, state model.CommandState, now
 	return nil
 }
 
-func (c *Commands) Settle(ack model.DeviceAck, now time.Time) (model.DeviceCommand, error) {
+// ValidateAck verifies an acknowledgement without changing command state.
+func (c *Commands) ValidateAck(ack model.DeviceAck) (model.DeviceCommand, error) {
+	c.mu.RLock()
+	command, ok := c.byID[ack.CommandID]
+	c.mu.RUnlock()
+	if !ok {
+		return model.DeviceCommand{}, fmt.Errorf("unknown command %s", ack.CommandID)
+	}
+	if err := validateAck(command, ack); err != nil {
+		return model.DeviceCommand{}, err
+	}
+	return command, nil
+}
+
+func validateAck(command model.DeviceCommand, ack model.DeviceAck) error {
+	if !ack.Matches(command) {
+		return errors.New("ack identity does not match command generation")
+	}
+	if !ack.Settled {
+		return errors.New("device has not settled")
+	}
+	switch command.State {
+	case model.CommandSettled:
+		return ErrDuplicateAck
+	case model.CommandCancelled, model.CommandFailed:
+		return ErrStaleAck
+	}
+	return nil
+}
+
+// CommitSettle transitions a validated command to settled and returns both
+// the committed command and its pre-commit snapshot. Validation is repeated
+// under the lock so a cancellation racing the caller's pre-check can still
+// reject the acknowledgement.
+func (c *Commands) CommitSettle(ack model.DeviceAck, now time.Time) (model.DeviceCommand, model.DeviceCommand, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	command, ok := c.byID[ack.CommandID]
 	if !ok {
-		return model.DeviceCommand{}, fmt.Errorf("unknown command %s", ack.CommandID)
+		return model.DeviceCommand{}, model.DeviceCommand{}, fmt.Errorf("unknown command %s", ack.CommandID)
 	}
-	if !ack.Matches(command) {
-		return model.DeviceCommand{}, errors.New("ack identity does not match command generation")
-	}
-	if !ack.Settled {
-		return model.DeviceCommand{}, errors.New("device has not settled")
+	previous := command
+	if err := validateAck(command, ack); err != nil {
+		return model.DeviceCommand{}, model.DeviceCommand{}, err
 	}
 	if err := command.SetState(model.CommandSettled, now); err != nil {
-		return model.DeviceCommand{}, err
+		return model.DeviceCommand{}, model.DeviceCommand{}, err
 	}
 	c.byID[command.ID] = command
-	return command, nil
+	return command, previous, nil
+}
+
+// Revert restores the pre-commit command snapshot after a downstream step in
+// the same acknowledgement transaction failed. It refuses to overwrite a
+// command that changed since the settle commit (e.g. a concurrent cancel).
+func (c *Commands) Revert(committed, previous model.DeviceCommand) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current, ok := c.byID[committed.ID]
+	if !ok || current.State != model.CommandSettled || !current.UpdatedAt.Equal(committed.UpdatedAt) {
+		return errors.New("command changed since settle commit")
+	}
+	c.byID[committed.ID] = previous
+	return nil
 }
 
 func (c *Commands) CancelChamber(chamberID string, now time.Time) []model.DeviceCommand {
