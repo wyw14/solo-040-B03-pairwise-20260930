@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/wyw14/cry-96/internal/journal"
 	"github.com/wyw14/cry-96/internal/model"
 )
@@ -49,8 +50,14 @@ func (c *Controller) Request(ctx context.Context, cycle model.TransitCycle, dire
 	return command, err
 }
 
-func (c *Controller) Confirm(ctx context.Context, ack model.DeviceAck) (model.DeviceCommand, error) {
-	command, err := c.commands.Settle(ack, c.now())
+// CommitGateAck is the committing step for an acknowledgement. The caller must
+// already have validated the receipt (Commands.Resolve) and confirmed it
+// belongs to the live transit generation. Only then does this mark the command
+// settled, observe the terminal gate position and append the settlement event.
+// If the command became terminal in the meantime, nothing is mutated.
+func (c *Controller) CommitGateAck(ctx context.Context, commandID uuid.UUID) (model.DeviceCommand, error) {
+	now := c.now()
+	command, err := c.commands.MarkSettled(commandID, now)
 	if err != nil {
 		return model.DeviceCommand{}, err
 	}
@@ -62,11 +69,13 @@ func (c *Controller) Confirm(ctx context.Context, ack model.DeviceAck) (model.De
 	if command.Action == "open" {
 		position = model.GateOpen
 	}
-	if err := c.state.Observe(command.ChamberID, direction, position, c.now()); err != nil {
+	if err := c.state.Observe(command.ChamberID, direction, position, now); err != nil {
 		return model.DeviceCommand{}, err
 	}
-	_, err = c.recorder.Record(ctx, command.ChamberID, model.EventCommandSettled, command.CycleID, command.Generation, command)
-	return command, err
+	if _, err := c.recorder.Record(ctx, command.ChamberID, model.EventCommandSettled, command.CycleID, command.Generation, command); err != nil {
+		return model.DeviceCommand{}, err
+	}
+	return command, nil
 }
 
 func (c *Controller) Observe(chamberID string, direction model.Direction, position model.GatePosition) error {

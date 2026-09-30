@@ -80,10 +80,15 @@ func (c *Coordinator) Cancel(ctx context.Context, chamberID, reason string) (mod
 }
 
 func (c *Coordinator) ApplyGateAck(ctx context.Context, ack model.DeviceAck) error {
-	command, err := c.gates.Confirm(ctx, ack)
+	// Phase 1 — validate the receipt before anything is mutated. Resolve is
+	// strictly read-only, so unknown, mismatched, unsettled, cancelled, failed
+	// or duplicate receipts are rejected with command, gate and event state
+	// untouched.
+	command, err := c.gates.Commands().Resolve(ack)
 	if err != nil {
 		return err
 	}
+
 	c.mu.Lock()
 	cycleValue, ok := c.current[ack.ChamberID]
 	if !ok || cycleValue.Stage.Terminal() || !cycleValue.IdentityMatches(command.CycleID, command.Generation) {
@@ -91,16 +96,27 @@ func (c *Coordinator) ApplyGateAck(ctx context.Context, ack model.DeviceAck) err
 		return errors.New("device acknowledgement belongs to an inactive transit generation")
 	}
 	next, err := nextAfterGate(cycleValue.Stage)
-	if err == nil {
-		err = cycleValue.Advance(next, "matching gate command settled", c.now())
-	}
-	if err == nil {
-		c.current[ack.ChamberID] = cycleValue
-	}
-	c.mu.Unlock()
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
+	// Advance the local copy first: it is a dry run that is only published to
+	// c.current below, so a transition error rejects before any commit.
+	if err := cycleValue.Advance(next, "matching gate command settled", c.now()); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+
+	// Phase 2 — commit while holding the cycle lock. A concurrent cancellation
+	// must take c.mu to cancel the command, so it cannot slip in between the
+	// generation check and the settlement here.
+	if _, err := c.gates.CommitGateAck(ctx, command.ID); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.current[ack.ChamberID] = cycleValue
+	c.mu.Unlock()
+
 	if next == model.StageLeveling {
 		if err := c.hydraulics.BeginLeveling(cycleValue); err != nil {
 			return err

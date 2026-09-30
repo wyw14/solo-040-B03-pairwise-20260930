@@ -66,9 +66,14 @@ func (c *Commands) transition(commandID uuid.UUID, state model.CommandState, now
 	return nil
 }
 
-func (c *Commands) Settle(ack model.DeviceAck, now time.Time) (model.DeviceCommand, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// Resolve validates an acknowledgement without touching command state. It lets
+// the caller decide whether the receipt belongs to the live transit before any
+// command, gate or event mutation happens. A receipt for a cancelled, failed or
+// already-settled command is rejected, which also makes duplicate receipts a
+// read-only no-op.
+func (c *Commands) Resolve(ack model.DeviceAck) (model.DeviceCommand, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	command, ok := c.byID[ack.CommandID]
 	if !ok {
 		return model.DeviceCommand{}, fmt.Errorf("unknown command %s", ack.CommandID)
@@ -78,6 +83,31 @@ func (c *Commands) Settle(ack model.DeviceAck, now time.Time) (model.DeviceComma
 	}
 	if !ack.Settled {
 		return model.DeviceCommand{}, errors.New("device has not settled")
+	}
+	switch command.State {
+	case model.CommandCancelled:
+		return model.DeviceCommand{}, errors.New("command was cancelled before receipt arrived")
+	case model.CommandFailed:
+		return model.DeviceCommand{}, errors.New("command failed before receipt arrived")
+	case model.CommandSettled:
+		return model.DeviceCommand{}, errors.New("duplicate settlement for command")
+	}
+	return command, nil
+}
+
+// MarkSettled is the committing half of Resolve. It is reached only after the
+// caller has verified the receipt and advanced its own state, so it flips the
+// command exactly once. A command that became terminal in the meantime (for
+// example cancelled by an emergency stop) is left untouched.
+func (c *Commands) MarkSettled(commandID uuid.UUID, now time.Time) (model.DeviceCommand, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	command, ok := c.byID[commandID]
+	if !ok {
+		return model.DeviceCommand{}, fmt.Errorf("unknown command %s", commandID)
+	}
+	if command.State.Terminal() {
+		return model.DeviceCommand{}, fmt.Errorf("command %s is already terminal", commandID)
 	}
 	if err := command.SetState(model.CommandSettled, now); err != nil {
 		return model.DeviceCommand{}, err
